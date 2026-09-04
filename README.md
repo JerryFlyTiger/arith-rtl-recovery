@@ -54,6 +54,63 @@ Of the 19 fully-solved cases, **15 have a cost that exactly matches the hand-rev
 
 ---
 
+## Contest results (Alpha / Beta)
+
+The organizers published result sheets for the Alpha Test and the Beta Test. Scoring
+**the version in this repo** (four families only) under the original rules gives:
+
+```
+reduction_rate = (1 - cost / gate_count) x 100%   must be >= 70%, else 0 points for that case
+point          = min(cost of the case from all teams) / cost
+final_score    = sum of point over all cases
+```
+
+| | this repo (4 families) | unreleased full version |
+|---|---|---|
+| **Alpha Test** | **14.00 / 20, 1st of 7 teams** | 20.00 / 20, 1st |
+| **Beta Test** | **14.00 / 20, 1st** | 20.00 / 20, 1st |
+| Beta: upper bound for any single team | 13.32 / 20 | 11.84 / 20 |
+
+⚠ **Two things need saying, or that table reads better than it is.**
+
+**First, this repo wins by a hair.** In the Beta column, 14.00 against an upper bound of 13.32 -- a margin of 0.68.
+The full version is 20.00 against 11.84; that is a win with room in it. The whole difference comes from the families that are not published here.
+
+**Second, Alpha wiped almost everyone out.** Across six teams and twenty cases, only `test01`
+and `test02` scored at all; every other case was either a `Fail` or a submission whose reduction rate fell far below 70%. Scoring 14
+in a field where everyone else scored 1 or 2 says the problem was hard that year, not that this version is strong.
+
+In the Beta sheet the row counts vary and every case is sorted by ascending cost, so a row is **a rank within that case**, not a fixed
+team slot; individual team totals are therefore not recoverable. The upper bound above is a hypothetical team assembled from the best
+entry of every case, so **no real team can be above it**. In the Alpha sheet every case has exactly
+six rows and a `Pass` can appear below a `Fail`, which means rows are fixed team slots -- so full standings can be reconstructed.
+
+### Final: no official result exists
+
+The organizers published only the Alpha and Beta sheets. There is **no final scoreboard**, so there is no opponent
+to compare against and **no rank can be given**. What can be reported is this repo's own result over all 30 cases:
+
+| | |
+|---|---|
+| fully recovered / partial / all fallback | **19 / 3 / 8** |
+| cases clearing the 70% bar | **19 / 30** (judged per case) |
+| total cost / total gates | 60,360 / 207,397 |
+| overall reduction | 70.90% (a weighted figure -- see the caveat in the previous section) |
+
+### Three caveats
+
+1. **Alpha and Beta covered only the 20 public cases.** The organizers' Q&A confirms the final evaluation
+   contained withheld cases, but the proportion was never settled -- the wording is only 'may have 50%'. Performance on unseen
+   shapes is not measured by any number above.
+2. **The timelines are not comparable.** This is today's solver against test sets from 2022, built with those cases
+   in hand and iterated on repeatedly, while the entrants worked to a deadline.
+3. **Costs are computed by this repo's `tools/costcount.py`**; the official grader may differ in detail.
+
+The official result sheets themselves are **not redistributed with this repo** (copyright belongs to the organizers); obtain them from
+the [ICCAD CAD Contest](http://iccad-contest.org/) website.
+
+---
+
 ## Why this problem matters
 
 This problem was not invented just for the contest. The problem statement opens with its motivation:
