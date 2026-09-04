@@ -1,0 +1,1 @@
+out1[17:0] = in1*in2 + $signed(in3)*$signed(in4)

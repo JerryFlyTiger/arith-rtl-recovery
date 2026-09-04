@@ -1,0 +1,1 @@
+out1[11:0] = (in1<in2) ? in3 : in4 -- the branches are 8-bit ports, the output is 12 bits, atom width != word width, forcing out the zero-extension path

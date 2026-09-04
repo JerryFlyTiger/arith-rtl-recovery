@@ -1,0 +1,1 @@
+out1 = ((in1 < in2) < in1) (the comparison result is fed into another comparison, a derived atom)

@@ -1,0 +1,1 @@
+out1[7:0] = 200 (constant); out2[7:0] = in2 + 1; in1 is completely unused

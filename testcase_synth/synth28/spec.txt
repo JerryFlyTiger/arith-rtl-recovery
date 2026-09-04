@@ -1,0 +1,4 @@
+out1 = (comp_a < comp_b) ? in2 : in3 (M29 second round: comparison-driven mux functional support pruning --
+in1 structurally falls within out1's fanin cone (t3=buf(in1) feeds t4=c?in2:t3; t4 is then
+consumed once more by out1=c?t4:in3 using the same condition c), which never functionally affects out1;
+isomorphic to covsweep --seed 1's random_131 out1)

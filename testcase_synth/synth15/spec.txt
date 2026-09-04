@@ -1,0 +1,1 @@
+out1 = ($signed(in1) < $signed(in2)) ? in2 : in1 (signed max)

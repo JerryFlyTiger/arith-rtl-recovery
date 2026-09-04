@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Organizer materials: copyright belongs to the 2022 ICCAD CAD Contest / Cadence Design Systems,
+# Not redistributed. See README for how to obtain it.
+# ---------------------------------------------------------------------------
+testcase/
+Problem_Description/
+QA/
+test_result/
+
+# macOS
+.DS_Store
+._*
+
+# Machine-local settings: absolute-path overrides like ABC_BIN go here, not under version control
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Execution artifacts
+out/
+results/
+*.log
+
+# tools/rtlcheck.py's scratch workspace (renamed modules, testbenches, iverilog artifacts)
+.rtlcheck/
+
+# tools/solverbench.py's solver output (RTL produced by the regression bench, not under version control)
+.solverout/
+
+# Log files ABC leaves behind in cwd when it runs
+abc.history
+.fuzzcse/
+
+# demo/ artifacts (reproducible via gen_netlists.py; demo/out/ is already covered by out/ above)
+demo/netlists/

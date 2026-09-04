@@ -1,0 +1,1 @@
+out1[8:0] = in1*in2 + in3 (in1 is 1-bit)

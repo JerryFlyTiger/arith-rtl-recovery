@@ -1,0 +1,1 @@
+out1 = (in1(unsigned) - $signed(in3)) == 1; the correct solution must not have in1 wrongly judged as signed

@@ -1,0 +1,1 @@
+out1 = (in1 >= 500000), a 20-bit port, with the threshold falling in a narrow interval that standard vectors almost never hit

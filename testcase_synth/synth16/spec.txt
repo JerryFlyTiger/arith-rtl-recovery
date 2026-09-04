@@ -1,0 +1,1 @@
+outB[8:0] = in1+in2 (a word declared earlier); outA[8:0] = (in3<in4) ? outB : in5 (references outB as X)
