@@ -34,13 +34,15 @@ Single-threaded, uses only the Python standard library, calls no external tools.
 What this repo makes public is the **framework, the verification toolchain, and four expression families** (linear, quadratic, comparison,
 and guard-product). A further batch of families handling harder shapes, plus the common-subexpression optimization layer, **are not in this repo**.
 
-The difference is measured, not adjectival:
+**There is an unreleased version that performs markedly better than this repo on the same test set.**
 
-| | this repo (4 families) | unreleased full version |
-|---|---|---|
-| total cost across all 30 cases | **60,360** | 667 |
-| overall reduction | 70.90% | 99.68% |
-| fully solved / partial / full fallback | **19 / 3 / 8** | 30 / 0 / 0 |
+Measured figures for the version in this repo:
+
+| | this repo (4 families) |
+|---|---|
+| total cost over all 30 cases | **60,360** |
+| overall reduction | 70.90% |
+| fully recovered / partial / all fallback | **19 / 3 / 8** |
 
 ⚠ **That 70.90% is a weighted number; it does not mean "passing".** It is inflated by a single case with 91,584 gates;
 the problem's 70% threshold is judged **per case**, so this version of the repo actually has **11 cases
@@ -51,6 +53,126 @@ The cost looks bad, but the output is **guaranteed equivalent**. This discipline
 than emit non-equivalent RTL. All 30 cases pass `rtlcheck`.
 
 Of the 19 fully-solved cases, **15 have a cost that exactly matches the hand-reverse-engineered solution**.
+
+---
+
+## Algorithm and program flow
+
+### Top-level pipeline
+
+The input is a flattened Verilog netlist containing nothing but primitive gates. The output is
+RTL that is functionally equivalent and uses as few operators as possible. **The solver never reads wire names** -- in the real problem
+they are stripped, so there would be nothing to read.
+
+```mermaid
+flowchart TD
+  A["netlist.v"] --> B["Netlist()<br/>parse, build driver map"]
+  B --> C["generate validation vectors<br/>two independent seeds, 512 each"]
+  C --> D["decide()<br/>one output word at a time"]
+  D --> E["final rewrite passes"]
+  E --> F["assemble()<br/>emit text, then assert seven invariants"]
+  F --> G["rtl.v"]
+  B -. "any exception anywhere" .-> X["emergency fallback<br/>transcribe the whole netlist gate for gate"]
+  D -. .-> X
+  E -. .-> X
+  F -. .-> X
+  X --> G
+```
+
+The fallback has three descending levels: transcribe the whole netlist gate for gate, copy the input file verbatim, then emit an empty module.
+**The program never crashes and never emits RTL that is not equivalent** -- at worst it emits something expensive.
+
+### The per-word decision
+
+`decide()` walks the output words in declaration order. A word is either recovered as one whole `assign`,
+or it falls back as a whole -- **there is no partial recovery inside a word**.
+
+```mermaid
+flowchart TD
+  W["one output word"] --> K["which already-solved words may it reference?<br/>declared earlier, disjoint cone, wide enough"]
+  K --> P["try ALL primary families<br/>linear, quadratic, compare, guard product"]
+  P --> Q{"any candidate?"}
+  Q -- "yes" --> C1["candidate list<br/>cost + shared-pool reference price"]
+  Q -- "no" --> S["try ALL secondary families"]
+  S --> C1
+  C1 --> M["take the lowest cost"]
+  M --> N{"lowest cost <= fallback cost?"}
+  N -- "yes" --> Y["adopt the expression"]
+  N -- "no" --> F["fall back: transcribe this word's cone gate for gate"]
+  style Y fill:#065f46,color:#ecfdf5,stroke:#10b981
+  style F fill:#7f1d1d,color:#fef2f2,stroke:#ef4444
+```
+
+Two properties are easy to get wrong when reading the code:
+
+- **Families are not first-come-first-served.** Every primary family runs, and the cheapest candidate wins.
+- **Secondary families run only when the primary pool came up empty.** This is a deliberate safety constraint, not an optimisation:
+  it guarantees that adding a family can never change the output of a word that **already had an answer**.
+
+All four families published in this repo are primary:
+
+| kind | what shape it recognises | example |
+|---|---|---|
+| `linear` | weighted sums of ports | `3*in1 + 5*in2 + 7` |
+| `quadratic` | degree-2 polynomials, products included | `in1*in2 + in3` |
+| `compare` | comparisons `sum(c*atom) REL k` | `(in1 - in3) > in2` |
+| `mux` | guard products | `in4 ? (in1*in2) : 0` |
+
+### Expression rendering and its rewrites
+
+The two families whose result is a term list (`linear`, `quadratic`) do not simply flatten the terms. The renderer
+builds four candidate renderings and keeps the cheapest, and **a rewrite replaces the incumbent only on a strict improvement** -- ties keep the earlier
+one, which is what makes the output byte-stable across releases.
+
+```mermaid
+flowchart LR
+  B["baseline<br/>flattened add/subtract sequence"] --> R1["R1<br/>common factor extraction"]
+  R1 --> R3["R3<br/>reference an already-solved word"]
+  R3 --> R2["R2<br/>reconstruct a mux"]
+  R2 --> O["cheapest wins"]
+  style O fill:#065f46,color:#ecfdf5,stroke:#10b981
+```
+
+### Verification layers
+
+The solver fits against simulation, but **fitting well is not the same as being correct**. The gap between the Python model and the emitted
+Verilog **text** is where this project has produced the most real defects.
+
+```mermaid
+flowchart TD
+  M["Python model<br/>candidate terms"] -->|"simulate the netlist, 512 training vectors"| A1["fit"]
+  A1 -->|"512 vectors from an independent seed"| A2["accept or reject"]
+  A2 --> T["rendered Verilog text"]
+  T -->|"rtlcheck: one testbench, solver output<br/>and original netlist side by side"| E["equivalence"]
+  E --> S1["solverbench: full regression rig"]
+  E --> S2["gensynth: self-generated synthetic cases"]
+  style T fill:#7c2d12,color:#fff7ed,stroke:#ea580c
+  style E fill:#1e3a8a,color:#eff6ff,stroke:#3b82f6
+```
+
+`rtlcheck` is the only instrument that **crosses from the model into the text** -- it actually runs the output in a simulator.
+
+### A worked example
+
+The `demo/` netlists are generated on the spot by `demo/gen_netlists.py`, so **no contest material is needed**:
+
+```bash
+python3 demo/gen_netlists.py
+python3 solver/main.py -input demo/netlists/d4_macc.v -output /tmp/out.v --verbose
+#   out1: solved by quadratic, cost 2 vs fallback 238
+```
+
+```mermaid
+flowchart TD
+  A["238 gates"] --> B["linear: no candidate"]
+  B --> C["quadratic: candidate found, cost 2"]
+  C --> D["primary pool is non-empty<br/>so the secondary families never run"]
+  D --> E["cost 2 <= fallback 238, adopt"]
+  E --> F["assign out1 = in3 + in1 * in2;"]
+  style F fill:#065f46,color:#ecfdf5,stroke:#10b981
+```
+
+238 gates recovered as two operators, a reduction of 99.2%, `rtlcheck` PASS.
 
 ---
 
@@ -65,16 +187,16 @@ point          = min(cost of the case from all teams) / cost
 final_score    = sum of point over all cases
 ```
 
-| | this repo (4 families) | unreleased full version |
-|---|---|---|
-| **Alpha Test** | **14.00 / 20, 1st of 7 teams** | 20.00 / 20, 1st |
-| **Beta Test** | **14.00 / 20, 1st** | 20.00 / 20, 1st |
-| Beta: upper bound for any single team | 13.32 / 20 | 11.84 / 20 |
+| | this repo (4 families) |
+|---|---|
+| **Alpha Test** | **14.00 / 20, 1st of 7 teams** |
+| **Beta Test** | **14.00 / 20, 1st** |
+| Beta: upper bound for any single team | 13.32 / 20 |
 
 ⚠ **Two things need saying, or that table reads better than it is.**
 
 **First, this repo wins by a hair.** In the Beta column, 14.00 against an upper bound of 13.32 -- a margin of 0.68.
-The full version is 20.00 against 11.84; that is a win with room in it. The whole difference comes from the families that are not published here.
+On a different set of unseen shapes that margin could flip at any time.
 
 **Second, Alpha wiped almost everyone out.** Across six teams and twenty cases, only `test01`
 and `test02` scored at all; every other case was either a `Fail` or a submission whose reduction rate fell far below 70%. Scoring 14
