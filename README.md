@@ -150,7 +150,7 @@ flowchart TD
   style E fill:#1e3a8a,color:#eff6ff,stroke:#3b82f6
 ```
 
-`rtlcheck` is the only instrument that **crosses from the model into the text** -- it actually runs the output in a simulator.
+`rtlcheck` is the only instrument that **executes** the text -- it actually runs the output in a simulator. `formalcheck` instead proves the text equivalent to the netlist, but cases with multipliers often time out.
 
 ### A worked example
 
@@ -288,7 +288,7 @@ For each of the five netlists it runs four steps: solver recovers RTL → print 
 The pitfall we hit over and over is not "the model computed wrong", but **"the Python model is correct, but the rendered Verilog
 text is not"** — width propagation, signedness, the left operand of `<<` gets its width from context,
 `**` is not truncated first in a wide context. These defects live in the gap between the model and the text — **only feeding the text into
-a real simulator can cross that gap**.
+a real simulator, or formally proving the text equivalent, can cross that gap**.
 
 So the toolchain divides the work like this:
 
@@ -300,6 +300,7 @@ So the toolchain divides the work like this:
 | `tools/solverbench.py` | Full-case regression rig: runs the solver, verifies equivalence, computes cost | `rtlcheck FAIL` is the most severe failure, always check it first |
 | `tools/costcount.py` | Counts operator cost from the Verilog text | hand-computed cost comments drift out of sync with the actual expression; this replaces hand-counting with machine-counting |
 | `tools/zcheck.py` | Uses z3 to formally verify equivalence between netlist and spec | hits an exponential wall when multiplication is involved, which is exactly why the simulation route above exists |
+| `tools/formalcheck.py` | Proves the recovered RTL equivalent to the original netlist with a yosys miter + SAT, reporting one of five verdicts: `EQUIV` / `NOT-EQUIV` / `TIMEOUT` / `UNSUPPORTED` / `ERROR` | `rtlcheck` samples, so rare counterexamples slip through; this one proves. Only `NOT-EQUIV` and `ERROR` are red; cases with multiplication often `TIMEOUT` |
 | `tools/classify.py` | Infers operator candidates from the netlist | **boundary sampling is essential**: purely random wide-word vectors cannot distinguish `<` from `< k` |
 
 Two criteria are baked into the tools:
@@ -367,6 +368,7 @@ The `SOLVER_FAMILIES=linear,quadratic` environment variable can enable only the 
 - **Python 3** — `solver/` has zero external dependencies (this is a self-imposed constraint; the problem places no restriction on language or packages)
 - **Icarus Verilog** — `brew install icarus-verilog`. Needed by `tools/rtlcheck.py`
 - **z3** (optional) — `tools/zcheck.py` needs `pip install z3-solver`
+- **yosys** — `brew install yosys`. Needed by `tools/formalcheck.py`; `tools/selftest.py` turns **red** without it (deliberately not a SKIP, so an unverified run cannot print "failed: 0")
 - **ABC** (optional) — Homebrew has no formula; `abc.lock` pins the exact upstream commit,
   `scripts/setup_abc.sh` builds against it, `scripts/find_abc.sh` prints which one to use
 

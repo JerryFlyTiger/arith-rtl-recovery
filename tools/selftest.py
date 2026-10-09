@@ -41,6 +41,7 @@ import mux  # noqa: E402
 import main as solver_main  # noqa: E402
 import registry  # noqa: E402
 import rtlcheck  # noqa: E402
+import formalcheck  # noqa: E402
 from refgen import Builder  # noqa: E402
 FAILED = []
 def check(name, got, want):
@@ -2650,6 +2651,205 @@ def test_registry_solver_families_env_filter():
             os.environ["SOLVER_FAMILIES"] = old_val
         else:
             os.environ.pop("SOLVER_FAMILIES", None)
+def test_formalcheck_fires_on_inequivalent_rtl():
+    """M32: the formal equivalence gate must first be proven to fire. Equivalent -> EQUIV; changing one operator -> NOT-EQUIV.
+    Also locks expand_pow (it expands only in the temporary file, and leaves a `**bold**` inside a comment alone)."""
+    import tempfile
+    ep = formalcheck.expand_pow
+    check("expand_pow parenthesized form ** 2", ep("(in1 ** 2)"), "(in1 * in1)")
+    check("expand_pow unparenthesized ** 3", ep("assign o = in1 ** 3;"), "assign o = (in1 * in1 * in1);")
+    check("expand_pow ** 6 expands into 5 *", ep("(x ** 6)").count("*"), 5)
+    check("expand_pow pre-extended wire name", ep("(s_in1_w8 ** 2)"), "(s_in1_w8 * s_in1_w8)")
+    check("expand_pow leaves **bold** in a comment alone", ep("// **bold** (a ** 2)\n"), "// **bold** (a ** 2)\n")
+    check("expand_pow leaves an in-line comment alone, expands the code",
+          ep("assign o = (a ** 2); // **x**"), "assign o = (a * a); // **x**")
+    # unary operators bind tighter than `**`: -a ** 2 is (-a) ** 2, and expanding to -(a*a) would change the semantics -> not expanded
+    check("expand_pow does not expand unary minus -a ** 2", ep("assign o = -a ** 2;"), "assign o = -a ** 2;")
+    check("expand_pow still expands binary minus b - a ** 2",
+          ep("assign o = b - a ** 2;"), "assign o = b - (a * a);")
+    # R6a: the unary operator is at the end of the previous line, `a ** 2` at the start of the next line
+    check("expand_pow cross-line: previous line ends with - so it is not expanded",
+          ep("assign o = -\n  a ** 2;"), "assign o = -\n  a ** 2;")
+    check("expand_pow cross-line: comment and blank lines are skipped, and the - on the previous code line is still seen",
+          ep("assign o = -\n  // comment\n\n  a ** 2;"), "assign o = -\n  // comment\n\n  a ** 2;")
+    check("expand_pow cross-line control: previous line ends with ( and it still expands (the guard is not \"never expand at line start\")",
+          ep("assign o = foo(\n  a ** 2);"), "assign o = foo(\n  (a * a));")
+    check("expand_pow cross-line control: previous line ends with = and it still expands",
+          ep("assign o =\n  a ** 2;"), "assign o =\n  (a * a);")
+    # T1: a block comment separating a unary operator -> the whole text is not expanded (otherwise -(a*a) changes the semantics)
+    check("expand_pow does not expand same-line - /* n */ a ** 2",
+          ep("assign o = - /* n */ a ** 2;"), "assign o = - /* n */ a ** 2;")
+    check("expand_pow does not expand cross-line - /* n */ newline a ** 2",
+          ep("assign o = - /* n */\n a ** 2;"), "assign o = - /* n */\n a ** 2;")
+    # U4: a `/*` after `//` does not count (the guard only looks at the code part); expanded as usual
+    check("expand_pow /* after // does not trigger the guard; expanded as usual",
+          ep("assign o = (a ** 2); // see /* here"), "assign o = (a * a); // see /* here")
+    check("expand_pow (* after // does not trigger the guard; expanded as usual",
+          ep("assign o = (a ** 2); // see (* here"), "assign o = (a * a); // see (* here")
+    # U5: `(* attr *)` separates a unary operator, same shape as T1 -> the whole text is not expanded
+    check("expand_pow - (* keep *) a ** 2 is not expanded",
+          ep("assign o = - (* keep *) a ** 2;"), "assign o = - (* keep *) a ** 2;")
+    # m2: prev_last must use the code with the // comment stripped, not the whole line (otherwise the trailing comment characters hide the -)
+    check("expand_pow cross-line: previous line has - followed by a // comment, still not expanded",
+          ep("assign o = - // n\n  a ** 2;"), "assign o = - // n\n  a ** 2;")
+    # m3: ~ is unary too
+    check("expand_pow does not expand unary ~a ** 2", ep("assign o = ~a ** 2;"), "assign o = ~a ** 2;")
+    # R6b: a sized constant is not an identifier
+    check("expand_pow does not expand 8'd3 ** 2", ep("assign o = 8'd3 ** 2;"), "assign o = 8'd3 ** 2;")
+    # R5: k<2 is not value-preserving (a ** 0 -> 1 changes signedness propagation in mixed-signedness comparisons), left for yosys to report UNSUPPORTED
+    check("expand_pow does not expand a ** 0", ep("assign o = a ** 0;"), "assign o = a ** 0;")
+    check("expand_pow does not expand a ** 1", ep("assign o = a ** 1;"), "assign o = a ** 1;")
+    check("expand_pow does not expand (a ** 0)", ep("assign o = (a ** 0);"), "assign o = (a ** 0);")
+    check("classify rc=1 + $pow message -> UNSUPPORTED",
+          formalcheck.classify(1, "No SAT model available for cell x ($pow)"), "UNSUPPORTED")
+    check("classify rc=124 -> TIMEOUT", formalcheck.classify(124, ""), "TIMEOUT")
+    # The final `return "ERROR"` of classify: a yosys crash, a syntax error, or a missing file all land in this branch,
+    # Changing this to "EQUIV" is a silent fake green. The inputs of the earlier branches never reach here, so it must be locked separately.
+    check("classify rc=2 + garbage output -> ERROR", formalcheck.classify(2, "garbage"), "ERROR")
+    check("classify rc=1 + empty output -> ERROR", formalcheck.classify(1, ""), "ERROR")
+    # U1: the "delete stale yosys.log" step at the start of check_pair must come before the preparation stage. Nonexistent gate path -> preparation stage fails
+    # and returns ERROR; if the log removal came after prep, the stale log here would be left behind (does not need yosys).
+    with tempfile.TemporaryDirectory() as td_u1:
+        wd_u1 = os.path.join(td_u1, "w")
+        os.makedirs(wd_u1)
+        log_u1 = os.path.join(wd_u1, "yosys.log")
+        with open(log_u1, "w") as fh:
+            fh.write("stale counterexample")
+        r_u1 = formalcheck.check_pair("gold.v", os.path.join(td_u1, "nonexistent.v"), wd_u1)[0]
+        check("preparation stage fails -> ERROR", r_u1, "ERROR")
+        check("preparation stage fails -> stale yosys.log has still been deleted (log removal happens before prep)",
+              os.path.exists(log_u1), False)
+    if shutil.which("yosys") is None:
+        check("yosys not found -- this gate did not really verify anything, do not treat it as a pass", "yosys", "found")
+        return
+
+    # gold uses `testcase_synth/synth08` (`in2 + (in1 ** 2)`): it is under version control and the public tree has it too
+    # (DIRS in mkpublic.py includes testcase_synth); after expansion, EQUIV takes only about 0.2~0.4 seconds.
+    # Do not use `testcase/` (gitignored): a missing file must light a red light and must not SKIP into "failures: 0".
+    # The gate side is always an inline string and never reads `.solverout/` (not under version control, gets overwritten).
+    gold = os.path.join(ROOT, "testcase_synth", "synth08", "top_primitive.v")
+    if not os.path.exists(gold):
+        check("testcase_synth/synth08 not found -- this gate did not really verify anything, do not treat it as a pass", "missing", "found")
+        return
+
+    GOOD = ("module top(in1, in2, out1);\n"
+            "  input [7:0] in1;\n  input [7:0] in2;\n  output [16:0] out1;\n"
+            "  assign out1 = in2 + (in1 ** 2);\nendmodule\n")
+    POW3 = GOOD.replace("** 2", "** 3")
+    SUB = GOOD.replace("in2 + (", "in2 - (")
+
+    with tempfile.TemporaryDirectory() as td:
+        def run(name, text, timeout=30, expand=True):
+            f = os.path.join(td, name + ".v")
+            with open(f, "w") as fh:
+                fh.write(text)
+            if expand:
+                return formalcheck.check_pair(gold, f, os.path.join(td, name), timeout)[0]
+            orig = formalcheck.expand_pow
+            formalcheck.expand_pow = lambda t: t
+            try:
+                return formalcheck.check_pair(gold, f, os.path.join(td, name), timeout)[0]
+            finally:
+                formalcheck.expand_pow = orig
+
+        # This is the lock for "expand_pow is really wired in": if the expansion is not wired in, `**` is sent to yosys as is,
+        # SAT does not support $pow -> UNSUPPORTED.
+        check("equivalent RTL containing ** (after expansion) -> EQUIV", run("good", GOOD), "EQUIV")
+        check("change ** 2 to ** 3 -> NOT-EQUIV (the expanded repeated multiplication is really what gets proven)",
+              run("pow3", POW3), "NOT-EQUIV")
+        check("change + to - -> NOT-EQUIV", run("sub", SUB), "NOT-EQUIV")
+        # Locks the **premise**: `$pow` really does make SAT hang, so expand_pow is not decorative.
+        check("`**` not expanded -> UNSUPPORTED (proves $pow is a real hard limit)",
+              run("nopow", GOOD, expand=False), "UNSUPPORTED")
+
+        # exit code of main(): use subprocess to verify each branch of sys.exit and --min-proved.
+        def main_rc(gate_dir, *extra):
+            cmd = [sys.executable, os.path.join(ROOT, "tools", "formalcheck.py"),
+                   "--synth", "--gate-dir", gate_dir, "--timeout", "10", *extra]
+            return subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT).returncode
+
+        for name, text in (("good", GOOD), ("bad", SUB)):
+            d = os.path.join(td, "gd_" + name)
+            os.makedirs(d)
+            with open(os.path.join(d, "synth08.v"), "w") as fh:
+                fh.write(text)
+        check("main: equivalent gate -> exit 0", main_rc(os.path.join(td, "gd_good"), "synth08"), 0)
+        check("main: inequivalent gate -> exit 1", main_rc(os.path.join(td, "gd_bad"), "synth08"), 1)
+        # Auto-enumeration + an empty gate directory -> all SKIP. "Specifying a nonexistent case" cannot be used to verify --min-proved:
+        # that path itself exits 1 (counted as ERROR), so what gets verified is a different mechanism.
+        empty = os.path.join(td, "gd_empty")
+        os.makedirs(empty)
+        check("main: all SKIP, no threshold -> exit 0", main_rc(empty), 0)
+        check("main: all SKIP + --min-proved 1 -> exit 1", main_rc(empty, "--min-proved", "1"), 1)
+        check("main: EQUIV=1 + --min-proved 1 -> exit 0",
+              main_rc(os.path.join(td, "gd_good"), "synth08", "--min-proved", "1"), 0)
+
+        # F6: TimeoutExpired -> rc=124 -> TIMEOUT; preparation/startup failure -> ERROR (does not blow through the batch)
+        check("check_pair timeout=0.001 -> TIMEOUT",
+              formalcheck.check_pair(gold, os.path.join(td, "good.v"), os.path.join(td, "to"),
+                                     timeout=0.001)[0], "TIMEOUT")
+        # U2: a timeout too large for subprocess -> OverflowError; it must collapse into ERROR instead of blowing through
+        # (1e10 goes through OverflowError and nan through ValueError; one check locks each branch; the message must carry the exception type name)
+        for bad_t, sub, exc in ((1e10, "big", "OverflowError"), (float("nan"), "nan", "ValueError")):
+            try:
+                r_big, _, o_big = formalcheck.check_pair(gold, os.path.join(td, "good.v"),
+                                                         os.path.join(td, sub), timeout=bad_t)
+            except Exception as e:
+                r_big, o_big = f"exception {type(e).__name__}", ""
+            check(f"check_pair timeout={bad_t} -> ERROR (no exception raised)", r_big, "ERROR")
+            check(f"check_pair timeout={bad_t} -> message contains {exc}", exc in o_big, True)
+        check("check_pair with a nonexistent gate path -> ERROR",
+              formalcheck.check_pair(gold, os.path.join(td, "nonexistent.v"), os.path.join(td, "ne"))[0],
+              "ERROR")
+        # F5: an explicitly named case that is not found -> error; name normalization synth8 -> synth08
+        check("main: --synth synth99 (explicitly named, does not exist) -> exit 1",
+              main_rc(os.path.join(td, "gd_good"), "synth99"), 1)
+        check("main: synth8 normalized to synth08 -> exit 0",
+              main_rc(os.path.join(td, "gd_good"), "synth8"), 0)
+        check("main: all TIMEOUT cannot pass --min-proved -> exit 1",
+              main_rc(os.path.join(td, "gd_good"), "synth08", "--timeout", "0.001",
+                      "--min-proved", "1"), 1)
+        # R7: --timeout 0 does not mean "no limit", it is an argument error (argparse exit 2)
+        check("main: --timeout 0 -> exit 2",
+              main_rc(os.path.join(td, "gd_good"), "synth08", "--timeout", "0"), 2)
+        # T2: nan/inf are not finite positive numbers; they must be rejected in argparse, not end in a traceback
+        for bad in ("nan", "inf"):
+            rt = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "formalcheck.py"),
+                                 "--synth", "--gate-dir", os.path.join(td, "gd_good"),
+                                 "synth08", "--timeout", bad],
+                                capture_output=True, text=True, cwd=ROOT)
+            check(f"main: --timeout {bad} -> exit 2 (argparse, not the 1 from a traceback)", rt.returncode, 2)
+            check(f"main: --timeout {bad} -> no Traceback", "Traceback" not in rt.stderr, True)
+        # R8: directory missing during automatic enumeration -> one-line error + exit 1, not a traceback
+        r8 = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "formalcheck.py"),
+                             "--synth", "--gate-dir", os.path.join(td, "nonexistent_dir")],
+                            capture_output=True, text=True, cwd=ROOT)
+        check("main: automatic enumeration, gate directory does not exist -> exit 1", r8.returncode, 1)
+        check("main: gate directory does not exist -> a clear error, not a traceback",
+              ("not found" in r8.stderr) and ("Traceback" not in r8.stderr), True)
+        # T3: yosys fails to start -> ERROR, and the old yosys.log in the same workdir must be deleted
+        wd_stale = os.path.join(td, "stale")
+        os.makedirs(wd_stale)
+        stale_log = os.path.join(wd_stale, "yosys.log")
+        with open(stale_log, "w") as fh:
+            fh.write("stale counterexample")
+        orig_yosys = formalcheck.YOSYS
+        formalcheck.YOSYS = os.path.join(td, "nonexistent_yosys")
+        try:
+            r_stale, _, r_stale_txt = formalcheck.check_pair(gold, os.path.join(td, "good.v"), wd_stale)
+            r_stale_out = os.path.join(td, "nonexistent_yosys") in r_stale_txt
+        finally:
+            formalcheck.YOSYS = orig_yosys
+        check("yosys fails to start -> ERROR", r_stale, "ERROR")
+        check("yosys fails to start -> output contains the nonexistent yosys path", r_stale_out, True)
+        check("yosys fails to start -> the old yosys.log in the same workdir has been deleted", os.path.exists(stale_log), False)
+        # R1: the NOT-EQUIV counterexample must really land in yosys.log (only -show-inputs produces the input value table)
+        try:
+            with open(os.path.join(td, "sub", "yosys.log")) as fh:
+                ylog = fh.read()
+        except OSError:
+            ylog = ""
+        check("after NOT-EQUIV, yosys.log contains the counterexample input (in1)", "in1" in ylog, True)
 if __name__ == "__main__":
     print("render_word, all-negative coefficients:")
     test_all_negative_first_term()
@@ -2836,5 +3036,7 @@ if __name__ == "__main__":
     test_compare_boundary_solve_respects_wide_coeff()
     print("M31: determinism of compare's second stage:")
     test_compare_wide_stage_deterministic()
+    print("M32: the formal equivalence gate (formalcheck) fires, expand_pow:")
+    test_formalcheck_fires_on_inequivalent_rtl()
     print(f"\nfailed: {len(FAILED)}")
     sys.exit(1 if FAILED else 0)

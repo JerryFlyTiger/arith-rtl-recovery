@@ -38,3 +38,6 @@ abc.history
 
 # demo/ artifacts (reproducible via gen_netlists.py; demo/out/ is already covered by out/ above)
 demo/netlists/
+
+# Scratch workspace of tools/formalcheck.py (gate files after expanding **)
+.formalcheck/
