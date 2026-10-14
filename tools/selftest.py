@@ -1440,6 +1440,68 @@ class _SeqPool:
 
     def price(self, refs):
         return 0
+def test_costcount_concat_counts_symbols_and_contents():
+    """`{}` pricing of the acceptance instrument `costcount.cost_of_text`: each level is counted by the number of top-level elements,
+    nested inner levels are counted separately, and the operators / `[]` selects inside the concatenation are counted by the normal rules (must not be swallowed).
+    The replication form `{4{x}}` is undefined by the problem, see known-gaps; not locked."""
+    def c(rhs):
+        return cost_of_text(f"module top(); output x; assign x = {rhs}; endmodule")[0]
+    # From the problem Appendix A: 4 concatenation symbols + 2 `[]` selects = 6
+    # (The problem says 7 because the select of the LHS `x[9:3]` also counts; this tool counts only the RHS)
+    check("{a[7:4], b[3], c, 1'b0} = 6", c("{a[7:4], b[3], c, 1'b0}"), 6)
+    check("{a + b, c} = 3", c("{a + b, c}"), 3)
+    check("{a, b} = 2", c("{a, b}"), 2)
+    # Separator of the side buffer: the `-4` in `{-4, x}` is a negative constant (free); if the separator became a single space,
+    # the prev before `-` is no longer `,` and it would be counted as a subtraction (over-counting)
+    check("{-4, x} = 2", c("{-4, x}"), 2)
+    check("{a, b} + {-4, c} = 5", c("{a, b} + {-4, c}"), 5)
+    check("{12'b0, x} = 2", c("{12'b0, x}"), 2)
+    check("{a, {b, c}} = 4", c("{a, {b, c}}"), 4)
+    check("{a * b, c[3]} = 4", c("{a * b, c[3]}"), 4)
+    # $unsigned is not priced: 2 concatenation symbols + `*` = 3
+    check("$unsigned({a * b, c}) = 3", c("$unsigned({a * b, c})"), 3)
+    check("control: a + b = 1 (same function)", c("a + b"), 1)
+def _readme_row(case, gates, cost):
+    return f"| test{case} | {gates} | x | y | {cost} | 12.34% |\n"
+def test_costcount_readme_costs_finds_table():
+    """Read priority and parsing of `readme_costs(root)`, using fake files in a temp directory, independent of the repo location
+    (neither the temp tree nor the public tree has docs/). docs/manual-solutions.md takes priority, README.md
+    is the fallback, and if neither exists return `{}`."""
+    import costcount
+    from costcount import readme_costs
+    with tempfile.TemporaryDirectory() as d:
+        check("neither present -> {}", readme_costs(d), {})
+        with open(os.path.join(d, "README.md"), "w") as f:
+            f.write(_readme_row("07", "1,234", 56))
+        check("README only -> read README, commas stripped", readme_costs(d), {"07": (1234, 56)})
+        os.makedirs(os.path.join(d, "docs"))
+        with open(os.path.join(d, "docs", "manual-solutions.md"), "w") as f:
+            f.write(_readme_row("26", "16,098", 52) + _readme_row("03", "9", 4))
+        check("both present -> read docs", readme_costs(d),
+              {"26": (16098, 52), "03": (9, 4)})
+    # Real-table canary: the fixture only locks parsing; it cannot catch "the real table was broken / moved".
+    if os.path.exists(os.path.join(costcount.ROOT, "docs", "manual-solutions.md")):
+        t = readme_costs()
+        check("real-table canary: at least 29 rows", len(t) >= 29, True)
+        check("real-table canary: test26 = (16098, 52)", t.get("26"), (16098, 52))
+    else:
+        print("  SKIP real-table canary (no docs/manual-solutions.md: temp tree or public tree)")
+def test_costcount_warn_if_empty_prints_only_when_empty():
+    """`warn_if_empty`: empty table -> stderr has output and the original table is returned; non-empty -> silent, returned as is."""
+    import contextlib
+    import io
+    from costcount import warn_if_empty
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        r = warn_if_empty({})
+    check("empty table returns {}", r, {})
+    check("empty table: stderr has a warning", "readme_costs" in buf.getvalue(), True)
+    buf = io.StringIO()
+    t = {"01": (1, 2)}
+    with contextlib.redirect_stderr(buf):
+        r = warn_if_empty(t)
+    check("non-empty table returned as is", r is t, True)
+    check("non-empty table: no stderr output", buf.getvalue(), "")
 def _test26_get_val():
     """test26's `out2 - out1` residual get_val (reused by (undisclosed
     family)'s unit tests, so each test doesn't have to rewrite it)."""
@@ -1449,6 +1511,198 @@ def _test26_get_val():
     def get_val(row):
         return (row["out2"] - row["out1"]) % M
     return nl, get_val
+def _global_cycle_netlist_text(w=6):
+    """Netlist with a cross-word combinational loop (itself acyclic): declaration order `r, q, nn`. `r = px&py`, but
+    `r[0]` structurally reads `nn[0]` (`nn[0]^px[0]^py[0]`, numerically always equal to `px[0]&py[0]`);
+    `q = (px&py)+px` and `nn = (px&py)+px+py` are each independent. The solver solves
+    `q = r + px`, `nn = q + py`, while the fallback `r` still keeps the structural edge `r[0] <- nn[0]`,
+    forming the cycle `nn -> q -> r[0] -> nn[0]`. Rules 1/2 are both local and cannot stop it."""
+    g = []
+    cnt = [0]
+
+    def gate(op, *ins):
+        cnt[0] += 1
+        o = f"w{cnt[0]}"
+        g.append(f"{op} g{cnt[0]}({o}, {', '.join(ins)});")
+        return o
+
+    def ands():
+        return [gate("and", f"px[{i}]", f"py[{i}]") for i in range(w)]
+
+    def add(a, b):
+        out = []
+        c = None
+        for i in range(w):
+            x = gate("xor", a[i], b[i])
+            if c is None:
+                out.append(x)
+                c = gate("and", a[i], b[i])
+            else:
+                out.append(gate("xor", x, c))
+                c = gate("or", gate("and", a[i], b[i]), gate("and", x, c))
+        return out
+    px = [f"px[{i}]" for i in range(w)]
+    py = [f"py[{i}]" for i in range(w)]
+    ra = ands()
+    ra[0] = gate("xor", "nn[0]", gate("xor", "px[0]", "py[0]"))
+    for i in range(w):
+        g.append(f"buf br{i}(r[{i}], {ra[i]});")
+    q = add(ands(), px)
+    for i in range(w):
+        g.append(f"buf bq{i}(q[{i}], {q[i]});")
+    nn = add(add(ands(), px), py)
+    for i in range(w):
+        g.append(f"buf bn{i}(nn[{i}], {nn[i]});")
+    return (f"module top(px, py, r, q, nn);\n  input [{w-1}:0] px;\n  input [{w-1}:0] py;\n"
+            f"  output [{w-1}:0] r;\n  output [{w-1}:0] q;\n  output [{w-1}:0] nn;\n"
+            + "\n".join("  " + x for x in g) + "\nendmodule\n")
+def _test26_with_const_outx(read_out1):
+    """Add a constant-0 `outX` (16 bits) to test26. `read_out1=False`: `outX` is declared after
+    `out1` and the gates read `in3` (the scenario of rule 1); `True`: `outX` is declared before `out1` and
+    the gates read `out1[i]` (the scenario of rule 2: declaration order passes but the cone contains a bit of `out1`)."""
+    base = open(os.path.join(ROOT, "testcase", "test26", "top_primitive.v")).read()
+    decl = "  output [15:0] out1, out2;"
+    assert base.count(decl) == 1
+    t = base.replace("out1, out2);", "out1, out2, outX);", 1)
+    if read_out1:
+        t = t.replace(decl, "  output [15:0] outX;\n" + decl)
+        src = "out1"
+    else:
+        t = t.replace(decl, decl + "\n  output [15:0] outX;")
+        src = "in3"
+    gs = "".join(f"  and gx{i}(outX[{i}], {src}[{i}], 1'b0);\n" for i in range(16))
+    return t.replace("endmodule", gs + "endmodule")
+def _handmade_two_word_netlist():
+    """Family-agnostic minimal netlist: inputs px/py, outputs a/b (4 bits), each driven by `buf` from an input."""
+    g = []
+    for i in range(4):
+        g.append(f"buf ba{i}(a[{i}], px[{i}]);")
+        g.append(f"buf bb{i}(b[{i}], py[{i}]);")
+    text = ("module top(px, py, a, b);\n  input [3:0] px;\n  input [3:0] py;\n"
+            "  output [3:0] a;\n  output [3:0] b;\n"
+            + "\n".join("  " + x for x in g) + "\nendmodule\n")
+    return Netlist(_write_tmp_netlist("handmade_two_word", text))
+def test_global_adj_pool_and_signed_edges():
+    """`_global_adj` must include the edges of pool wires and signed wires (F2).
+    (a) the cycle goes through a series of pool wires: `a = cse_p1 >> 1`, `cse_p1 = cse_p0 + a`;
+    (b) the cycle goes through a signed wire: `a = s_a_w4 + px`, `s_a_w4 = $signed(a)`;
+    each with an acyclic control (replace `a` with the input `px`). If the pool-term / signed lines did not enter the graph, neither cycle would be visible."""
+    nl = _handmade_two_word_netlist()
+    pool_lines = ["  wire [3:0] cse_p1;\n  assign cse_p1 = cse_p0 + a;"]
+    adj = solver_main._global_adj(nl, ["  assign a = cse_p1 >> 1;"], [], pool_lines, [])
+    cyc = solver_main._find_cycle(adj)
+    check("(a) cycle through a series of pool wires: cycle found", cyc is not None, True)
+    check("(a) cycle contains pool wire cse_p1", cyc is not None and "cse_p1" in cyc, True)
+    ok_pool = ["  assign cse_p1 = cse_p0 + px;"]
+    check("(a) control: pool term reading the input instead -> acyclic",
+          solver_main._find_cycle(solver_main._global_adj(
+              nl, ["  assign a = cse_p1 >> 1;"], [], ok_pool, [])), None)
+
+    signed_lines = ["  wire signed [3:0] s_a_w4;", "  assign s_a_w4 = $signed(a);"]
+    adj = solver_main._global_adj(nl, ["  assign a = s_a_w4 + px;"], signed_lines, [], [])
+    cyc = solver_main._find_cycle(adj)
+    check("(b) cycle through the signed wire: cycle found", cyc is not None, True)
+    check("(b) cycle contains signed wire s_a_w4", cyc is not None and "s_a_w4" in cyc, True)
+    ok_signed = ["  wire signed [3:0] s_a_w4;", "  assign s_a_w4 = $signed(px);"]
+    check("(b) control: signed wire reading the input instead -> acyclic",
+          solver_main._find_cycle(solver_main._global_adj(
+              nl, ["  assign a = s_a_w4 + px;"], ok_signed, [], [])), None)
+def test_global_adj_bit_precision_both_directions():
+    """Bit precision (F3a): reading `a[2]` depends on only that one bit.
+    Reverse: `b = a[2] + px`, fallback gates `a[0] <- b[1]`, `a[2] <- px[2]`: a[2] does not return to itself,
+    so it must be acyclic. Control: `b = a[0] + px` while `a[0] <- b[1]` really forms a cycle.
+    If `X[i]` were changed to depend on the whole word, the reverse case would falsely report a cycle."""
+    nl = _handmade_two_word_netlist()
+    gates = [("buf", "a[0]", ["b[1]"]), ("buf", "a[2]", ["px[2]"])]
+    check("reverse: b reads only a[2], a[2] does not return to itself via b -> acyclic",
+          solver_main._find_cycle(solver_main._global_adj(
+              nl, ["  assign b = a[2] + px;"], [], [], gates)), None)
+    cyc = solver_main._find_cycle(solver_main._global_adj(
+        nl, ["  assign b = a[0] + px;"], [], [], gates))
+    check("control: b reads a[0] and a[0] reads b[1] -> cycle", cyc is not None, True)
+    check("control: a[0] is on the cycle", cyc is not None and "a[0]" in cyc, True)
+def _handmade_cycle_decisions():
+    kind = solver_main.SOLVED_KINDS[0]
+    return {"a": solver_main.Cand(kind, "b + px", (), (), 0),
+            "b": solver_main.Cand(kind, "a + py", (), (), 0)}
+def _handmade_pool(nl):
+    return SharePool(fresh_prefix(nl.src, base="cse"),
+                      signed_prefix=fresh_prefix(nl.src, base="s"),
+                      port_widths=solver_main._all_port_widths(nl))
+def test_assemble_demotes_handmade_cycle():
+    """`assemble` demotion test independent of any family (runnable on the public export tree). Hand-built decisions:
+    `a = b + px`, `b = a + py` (reading each other forms a cycle). Assertions: demotion happens and it demotes the
+    `b` that is latest in declaration order; the structure reassembled after demotion is acyclic; `_check_invariants` does not raise (already called inside assemble);
+    and I8 has an independent lock: feeding a cyclic structure directly to `_check_invariants` must raise I8."""
+    nl = _handmade_two_word_netlist()
+    decisions = _handmade_cycle_decisions()
+    pool = _handmade_pool(nl)
+
+    pre = solver_main._assemble_parts(nl, decisions, pool)
+    pre_cyc = solver_main._find_cycle(solver_main._global_adj(
+        nl, pre["assign_lines"], pre["signed_lines"], pre["pool_lines"], pre["gates"]))
+    check("precondition: the hand-built decisions structure really has a cycle", pre_cyc is not None, True)
+
+    n0 = len(solver_main.GLOBAL_DEMOTIONS)
+    text = solver_main.assemble(nl, decisions, pool)
+    check("demotion happened and it demoted b, the latest in declaration order", solver_main.GLOBAL_DEMOTIONS[n0:], ["b"])
+    check("output still has the assign of a", "assign a = b + px;" in text, True)
+    check("b has been demoted to fallback (no assign b)", "assign b " in text, False)
+
+    after = dict(decisions)
+    after["b"] = ("fallback", None)
+    post = solver_main._assemble_parts(nl, after, pool)
+    check("structure after demotion is acyclic",
+          solver_main._find_cycle(solver_main._global_adj(
+              nl, post["assign_lines"], post["signed_lines"], post["pool_lines"],
+              post["gates"])), None)
+
+    # Independent lock for I8: feed a cyclic structure straight to _check_invariants.
+    msg = None
+    try:
+        solver_main._check_invariants(
+            nl, decisions, pre["solved_roots"], pre["fallback_roots"], pre["gates"],
+            pre["assign_lines"], pre["signed_lines"], pre["pool_lines"], pre["wire_lines"],
+            pre["signed_names"], pre["pool_names"], pool, pre["live_refs"])
+    except AssertionError as e:
+        msg = str(e)
+    check("_check_invariants raises I8 on a cyclic structure", msg is not None and "I8" in msg, True)
+def test_assemble_cycle_loop_terminates_with_runtime_error():
+    """Termination of the demotion loop cannot rely on `assert` (`python -O` strips it): with no victim, or
+    still cyclic after exceeding the limit, it must explicitly raise RuntimeError (handed to the emergency fallback of `main()`)."""
+    nl = _handmade_two_word_netlist()
+    decisions = _handmade_cycle_decisions()
+    orig_victim, orig_find = solver_main._cycle_victim, solver_main._find_cycle
+    try:
+        solver_main._cycle_victim = lambda *_a: None
+        err = None
+        try:
+            solver_main.assemble(nl, decisions, _handmade_pool(nl))
+        except Exception as e:
+            err = str(e)
+            check("no demotable word on the cycle -> exception type is RuntimeError",
+                  isinstance(e, RuntimeError), True)
+        check("no demotable word on the cycle -> RuntimeError", err is not None and "I8" in err, True)
+
+        # Always reports a cycle and always has a victim: must raise after len(outputs)+1 rounds, not loop forever.
+        calls = [0]
+
+        def always_cycle(_adj):
+            calls[0] += 1
+            return ["a[0]"]
+        solver_main._find_cycle = always_cycle
+        solver_main._cycle_victim = lambda *_a: "a"
+        err = None
+        try:
+            solver_main.assemble(nl, decisions, _handmade_pool(nl))
+        except Exception as e:
+            err = str(e)
+            check("exceeding the round limit -> exception type is RuntimeError",
+                  isinstance(e, RuntimeError), True)
+        check("exceeding the round limit -> raises", err is not None, True)
+        check("round limit = number of output words + 1", calls[0], len(nl.outputs) + 1)
+    finally:
+        solver_main._cycle_victim, solver_main._find_cycle = orig_victim, orig_find
 class _FakeNl:
     """`(undisclosed family).run` only reads `nl.inputs`/`nl.outputs`, so it doesn't need to actually parse a netlist."""
     def __init__(self, inputs, outputs):
@@ -3036,7 +3290,16 @@ if __name__ == "__main__":
     test_compare_boundary_solve_respects_wide_coeff()
     print("M31: determinism of compare's second stage:")
     test_compare_wide_stage_deterministic()
+    print("Global cycle check (demote when cross-word references form a cycle) and the locks for Stage 2 rules 1/2:")
+    test_global_adj_pool_and_signed_edges()
+    test_global_adj_bit_precision_both_directions()
+    test_assemble_demotes_handmade_cycle()
+    test_assemble_cycle_loop_terminates_with_runtime_error()
     print("M32: the formal equivalence gate (formalcheck) fires, expand_pow:")
     test_formalcheck_fires_on_inequivalent_rtl()
+    print("Acceptance instrument: costcount's {} pricing and the source of the cost table:")
+    test_costcount_concat_counts_symbols_and_contents()
+    test_costcount_readme_costs_finds_table()
+    test_costcount_warn_if_empty_prints_only_when_empty()
     print(f"\nfailed: {len(FAILED)}")
     sys.exit(1 if FAILED else 0)

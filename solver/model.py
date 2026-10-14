@@ -57,19 +57,24 @@ class Term:
                     a naturally unsigned port (a raw read) — either way, the
                     extension must be a **zero-extension** and must **not drift
                     depending on the surrounding expression's signedness context**.
-                    Rendered as `{ (width-port_width)'b0 , port }` (no extension is
-                    needed, and `port` is printed directly, when
-                    `port_width >= width`). This path is deliberately kept entirely
-                    separate from the existing `word_var` (which pre-extends into a
-                    signed wire only when `signed and port_width < width`), sharing
-                    no branch with it — `word_var` prints a **bare identifier**, and
-                    its zero-/sign-extension is decided by Verilog itself based on
-                    the whole expression's signedness context at that point, a
-                    context that can turn the entire expression signed when
-                    "all coefficients are ±1" (the module docstring of
-                    `(unpublished family).py` has the full derivation); `zext` uses
-                    `{}` concatenation to lay the bits out explicitly, a behavior
-                    that is context-free, and the two must never be mixed.
+                    Rendered as `$unsigned(port)`
+                    (when `port_width >= width` no extension is needed and `port` is printed directly).
+                    ⚠ The self-determined width of `$unsigned(x)` is the port width, not W; it is
+                    equivalent to zero-extending to W only in context-determined positions
+                    (the right side of `assign`, the parent expression of add/sub/mul); in a
+                    self-determined position (e.g. an addition entirely wrapped by
+                    `$unsigned(...)`/`$signed(...)`, or a concatenation element)
+                    it would drop the carry. All current consumers are in safe positions.
+                    This path is deliberately kept entirely separate from the existing `word_var`
+                    (which pre-extends into a signed wire only when `signed and port_width <
+                    width`), sharing no branch with it
+                    — `word_var` prints a **bare identifier**, and its zero-/sign-extension is
+                    decided by Verilog itself based on the whole expression's signedness context
+                    at that point, a context that can turn the entire expression signed when
+                    "all coefficients are ±1" (the module docstring of `(unpublished family).py`
+                    has the full derivation); `zext` uses `$unsigned()` to explicitly specify
+                    unsigned, a behavior that does not depend on the surrounding signedness
+                    context, and the two must never be mixed.
 
     Signedness semantics ('word'/'sq'/'prod'/'pow' share the same rule — see
     `render_word`): pre-extension into an `s_<port>_w<width>` wire is only needed

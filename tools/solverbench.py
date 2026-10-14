@@ -22,7 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "solver"))
 from netlist import Netlist  # noqa: E402
-from costcount import cost_of_text, readme_costs  # noqa: E402
+from costcount import cost_of_text, readme_costs, warn_if_empty  # noqa: E402
 import rtlcheck  # noqa: E402
 from main import LABELS  # noqa: E402
 
@@ -130,7 +130,8 @@ def main(argv):
     outdir = os.path.join(ROOT, ".solverout")
     os.makedirs(outdir, exist_ok=True)
 
-    want = readme_costs()
+    # --synth never had a manual-solution table, so the warning would be false
+    want = readme_costs() if args.synth else warn_if_empty(readme_costs())
     rows = []
     hdr = (f"{'case':8} {'gates':>7} {'cost':>7} {'=op':>6} {'+gate':>7} {'red%':>7} "
            f"{'manual':>7} {'ratio':>7} {'words':16} {'rtlcheck':9} {'sec':>6}")

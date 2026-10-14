@@ -109,14 +109,26 @@ def cost_of_text(text):
         # implemented here as "the number of elements in the concatenation" -- see the module docstring for this interpretation.
         # ⚠ This section must run **after** sized literals have been replaced with ` K `, otherwise `{12'b0, x}`
         # the `'b0` inside would interfere with element splitting.
+        # Each `{...}` level is counted by the number of elements separated by top-level commas at that level (1 per element); the nested inner levels are
+        # counted separately; the concatenation **contents** (operators, [] selects, ternaries) are counted by the normal rules and must not be swallowed:
+        # starting from the innermost level, replace the group with an unpriced placeholder token, append the content to a side buffer,
+        # and finally reattach it to the rhs so that the later rules count as usual.
+        # replication form `{4{x}}` is undefined by the problem (see docs/known-gaps.md), and this rule naturally yields the result
+        # whatever it is, no test locks it.
         concat_syms = 0
-        for m in re.finditer(r"\{([^{}]*)\}", rhs):
-            inner = m.group(1).strip()
-            if inner:
-                concat_syms += len([x for x in inner.split(",") if x.strip()])
+        side = []
+        while True:
+            m = re.search(r"\{([^{}]*)\}", rhs)
+            if not m:
+                break
+            inner = m.group(1)
+            concat_syms += len([x for x in inner.split(",") if x.strip()])
+            side.append(inner)
+            rhs = rhs[:m.start()] + " CATn " + rhs[m.end():]
         if concat_syms:
             bump("{}", concat_syms)
-        rhs = re.sub(r"\{[^{}]*\}", " CAT ", rhs)
+        if side:
+            rhs = rhs + " , " + " , ".join(side)
 
         n = len(re.findall(r"\w\s*\[", rhs))       # bit-select (a declared width isn't on the RHS, so it won't be miscounted)
         if n:
@@ -160,15 +172,37 @@ def cost_of_text(text):
     return total, detail
 
 
-def readme_costs():
-    txt = open(os.path.join(ROOT, "README.md")).read()
+_COST_ROW = re.compile(
+    r"^\| test(\d\d) \| ([\d,]+) \|.*?\| (\d+) \| [\d.]+% \|", re.M)
+
+
+def readme_costs(root=None):
+    """Read the `| testNN | gates | … | cost | xx% |` table. After the README restructuring the table moved to
+    docs/manual-solutions.md; README.md is read only if that file does not exist. If not a single row can be read,
+    return an empty table (the caller prints a warning via `warn_if_empty`; this must not be silent).
+    `root` defaults to `ROOT`; tests pass a temp directory so they don't depend on the repo location (neither the temp tree nor the public tree has docs/)."""
+    root = ROOT if root is None else root
+    for rel in ("docs/manual-solutions.md", "README.md"):
+        path = os.path.join(root, rel)
+        if os.path.exists(path):
+            txt = open(path).read()
+            break
+    else:
+        return {}
     return {m.group(1): (int(m.group(2).replace(",", "")), int(m.group(3)))
-            for m in re.finditer(
-                r"^\| test(\d\d) \| ([\d,]+) \|.*?\| (\d+) \| [\d.]+% \|", txt, re.M)}
+            for m in _COST_ROW.finditer(txt)}
+
+
+def warn_if_empty(table):
+    if not table:
+        print("WARNING: readme_costs() could not read any row of the cost table"
+              " (docs/manual-solutions.md / README.md) -- the reconciliation result cannot be trusted",
+              file=sys.stderr)
+    return table
 
 
 if __name__ == "__main__":
-    want = readme_costs()
+    want = warn_if_empty(readme_costs())
     sols = os.path.join(ROOT, "solutions")
     args = sys.argv[1:]
     cases = ([f"{int(a):02d}" for a in args] if args

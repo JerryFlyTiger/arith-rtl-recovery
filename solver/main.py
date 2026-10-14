@@ -368,6 +368,112 @@ def _assert_no_cycle(adj):
                 stack.pop()
 
 
+_SIZED_LIT_ONLY_RE = re.compile(r"\d+'[sS]?[bodhBODH][0-9a-fA-FxXzZ_?]*")
+_READ_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)(?:\s*\[\s*(\d+)\s*\])?")
+_ASSIGN_RE = re.compile(r"^\s*assign\s+(\S+)\s*=\s*(.*?);\s*$")
+
+# Record of global demotions: every time `assemble` demotes a solved word to fallback because of the global cycle check,
+# the word name is appended here. Used by selftest to assert that "demotion really fired", and also
+# by `tools/probe_m33.py --corpus-demotions` (the current corpus should never demote even once);
+# it takes no part in any output decision.
+GLOBAL_DEMOTIONS = []
+
+
+def _global_adj(nl, assign_lines, signed_lines, pool_lines, gates):
+    """Global, bit-level dependency graph: node (a driven net name) -> the set of nodes it reads.
+
+    The node granularity is the output **bit** (`nn[0]` and `nn[1]` differ); a pool wire / signed wire
+    is a single node as a whole. Reading the whole output word name `X` depends on all bits of X, while
+    reading `X[i]` depends on only that one bit. Input ports and constants are not keys; reading them
+    is a sink. Fallback gates: a gate's output net depends on the gate's input nets."""
+    word_bits = {}
+    for name, width in nl.outputs:
+        word_bits[name] = nl.bits([(name, width)])
+    bit_set = {b for bs in word_bits.values() for b in bs}
+
+    def reads_of(text):
+        text = _SIZED_LIT_ONLY_RE.sub(" ", text)
+        out = set()
+        for m in _READ_RE.finditer(text):
+            ident, idx = m.group(1), m.group(2)
+            if ident in _TEXT_KEYWORDS:
+                continue
+            if ident in word_bits:
+                bs = word_bits[ident]
+                bit = f"{ident}[{idx}]" if idx is not None else None
+                if bit is not None and bit in bit_set:
+                    out.add(bit)
+                else:
+                    out.update(bs)
+            else:
+                bit = f"{ident}[{idx}]" if idx is not None else None
+                out.add(bit if bit is not None and bit in bit_set else ident)
+        return out
+
+    adj = {}
+
+    def add(lhs, text):
+        lhs_nodes = word_bits.get(lhs, [lhs])
+        rd = reads_of(text)
+        for n in lhs_nodes:
+            adj.setdefault(n, set()).update(rd)
+
+    for block in (assign_lines, signed_lines, pool_lines):
+        for chunk in block:
+            for line in chunk.splitlines():
+                m = _ASSIGN_RE.match(line)
+                if m:
+                    add(m.group(1), m.group(2))
+    for _op, o, ins in gates:
+        adj.setdefault(o, set()).update(
+            x for i in ins for x in reads_of(i))
+    return adj
+
+
+def _find_cycle(adj):
+    """Return one cycle in the graph (a node list, first and last not repeated), or None if there is no cycle.
+    Deterministic: the start node and the neighbors are both visited in string-sorted order."""
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {}
+    for start in sorted(adj):
+        if color.get(start, WHITE) != WHITE:
+            continue
+        path = [start]
+        color[start] = GRAY
+        stack = [iter(sorted(n for n in adj.get(start, ()) if n in adj))]
+        while stack:
+            advanced = False
+            for nxt in stack[-1]:
+                c = color.get(nxt, WHITE)
+                if c == GRAY:
+                    return path[path.index(nxt):]
+                if c == WHITE:
+                    color[nxt] = GRAY
+                    path.append(nxt)
+                    stack.append(iter(sorted(n for n in adj.get(nxt, ()) if n in adj)))
+                    advanced = True
+                    break
+            if not advanced:
+                color[path[-1]] = BLACK
+                path.pop()
+                stack.pop()
+    return None
+
+
+def _cycle_victim(nl, decisions, cycle):
+    """The solved output word on the cycle that is latest in declaration order; None if the cycle has no solved word."""
+    bit_word = {}
+    for name, width in nl.outputs:
+        for b in nl.bits([(name, width)]):
+            bit_word[b] = name
+    on_cycle = {bit_word[n] for n in cycle if n in bit_word}
+    victim = None
+    for name, _w in nl.outputs:           # declaration order, the latter overrides the former
+        if name in on_cycle and decisions.get(name, ("fallback", None))[0] in SOLVED_KINDS:
+            victim = name
+    return victim
+
+
 def _check_invariants(nl, decisions, solved_roots, fallback_roots, gates,
                        assign_lines, signed_lines, pool_lines, wire_lines,
                        signed_names, pool_names, pool, live_refs):
@@ -398,6 +504,12 @@ def _check_invariants(nl, decisions, solved_roots, fallback_roots, gates,
     graph = {pool._names[k]: {pool._names[j] for j in pool._refs_of(k) if j in pool._names}
              for k in live_keys}
     _assert_no_cycle(graph)
+
+    # I8: globally acyclic -- output bits / pool wires / signed wires / fallback gates taken together form a bit-level
+    # dependency graph. I5 only looks at the pool-term graph and cannot see the edges between output words, or from fallback gates to output words.
+    # After the demotion loop of `assemble` this must always hold; it is the last line of defense.
+    cyc = _find_cycle(_global_adj(nl, assign_lines, signed_lines, pool_lines, gates))
+    assert cyc is None, f"I8 violation: global dependency graph has a cycle {cyc}"
 
     # I6: both operand names of a comparison candidate (M3b wiring) must be in the pool's set of materialized names —
     # "every operand of a comparison expression must be a `wire signed` from the pool, never a raw port directly"
@@ -437,7 +549,42 @@ def _check_invariants(nl, decisions, solved_roots, fallback_roots, gates,
     assert not missing, f"I7 violation: read of an undriven identifier {missing}"
 
 
-def assemble(nl, decisions, pool):
+def assemble(nl, decisions, pool, verbose=False):
+    """Assemble the final text. After assembly, run one global bit-level cycle check (`_global_adj`): the
+    cross-word reference guards of the families (declaration order + cone check) are local and not
+    transitive, and a fallback word keeps its structural edges to later-declared words, so the whole
+    may form a cycle. When a cycle is detected, demote the solved word that is latest in declaration
+    order on the cycle to fallback and reassemble, until acyclic (each round demotes at least one;
+    all-fallback is the original netlist, which is acyclic). The demotion is semantically safe: a
+    demoted word is still driven by the fallback gates, and other words referencing its name are unaffected."""
+    decisions = dict(decisions)
+    # Loop limit = number of output words + 1: each round demotes at least one word, and demoting them all gives the original netlist (acyclic).
+    # Do not rely on assert to guarantee termination (`python -O` strips asserts and would loop forever); on exceeding the limit or no victim,
+    # always raise explicitly, so that the emergency fallback of `main()` takes over.
+    for _round in range(len(nl.outputs) + 1):
+        built = _assemble_parts(nl, decisions, pool)
+        cyc = _find_cycle(_global_adj(nl, built["assign_lines"], built["signed_lines"],
+                                      built["pool_lines"], built["gates"]))
+        if cyc is None:
+            break
+        victim = _cycle_victim(nl, decisions, cyc)
+        if victim is None:
+            raise RuntimeError(f"I8 violation: global dependency graph has a cycle but no demotable solved word on it {cyc}")
+        decisions[victim] = ("fallback", None)
+        GLOBAL_DEMOTIONS.append(victim)
+        if verbose:
+            print(f"  global cycle check: {victim} is on the cycle ({' -> '.join(cyc)}), demoting to fallback",
+                  file=sys.stderr)
+    else:
+        raise RuntimeError("I8 violation: still cyclic after the demotion loop exceeded its limit")
+    _check_invariants(nl, decisions, built["solved_roots"], built["fallback_roots"],
+                      built["gates"], built["assign_lines"], built["signed_lines"],
+                      built["pool_lines"], built["wire_lines"], built["signed_names"],
+                      built["pool_names"], pool, built["live_refs"])
+    return built["text"]
+
+
+def _assemble_parts(nl, decisions, pool):
     header_ports, decl_lines = extract_module_text(nl.src)
 
     solved_roots = set()
@@ -480,10 +627,6 @@ def assemble(nl, decisions, pool):
         signed_lines.append(f"  wire signed [{width - 1}:0] {wn};")
         signed_lines.append(f"  assign {wn} = $signed({port});")
 
-    _check_invariants(nl, decisions, solved_roots, fallback_roots, gates,
-                       assign_lines, signed_lines, pool_lines, wire_lines,
-                       signed_names, pool_names, pool, live_refs)
-
     lines = [f"module top({header_ports});"]
     lines.extend(decl_lines)
     lines.extend(signed_lines)
@@ -492,7 +635,10 @@ def assemble(nl, decisions, pool):
     lines.extend(assign_lines)
     lines.extend(gate_lines)
     lines.append("endmodule")
-    return "\n".join(lines) + "\n"
+    return dict(text="\n".join(lines) + "\n", solved_roots=solved_roots,
+                fallback_roots=fallback_roots, gates=gates, assign_lines=assign_lines,
+                signed_lines=signed_lines, pool_lines=pool_lines, wire_lines=wire_lines,
+                signed_names=signed_names, pool_names=pool_names, live_refs=live_refs)
 
 
 def whole_netlist_fallback_text(nl):
@@ -515,7 +661,7 @@ def run(input_path, verbose=False):
                       signed_prefix=fresh_prefix(nl.src, base="s"),
                       port_widths=_all_port_widths(nl))
     decisions = decide(nl, pool, verbose=verbose)
-    return assemble(nl, decisions, pool)
+    return assemble(nl, decisions, pool, verbose=verbose)
 
 
 def emergency_fallback(input_path):
